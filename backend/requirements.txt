@@ -7,3 +7,4 @@ mediapipe
 scikit-learn
 joblib
 opencv-python-headless
+imbalanced-learn
