@@ -7,14 +7,32 @@ from PIL import Image
 import numpy as np
 import cv2
 import mediapipe as mp
-from app.model_utils import ModelManager
+from .model_utils import ModelManager  # <-- CORREGIDO: con punto
 import logging
+import os
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Hand Gesture Recognition API", version="1.0.0")
+
+# Agregar ruta raíz
+@app.get("/")
+def read_root():
+    return {
+        "message": "Hand Gesture Recognition API", 
+        "version": "1.0.0",
+        "endpoints": {
+            "upload_sample": "/api/upload_sample (POST)",
+            "train": "/api/train (POST)", 
+            "predict": "/api/predict (POST)",
+            "list_models": "/api/models (GET)",
+            "samples_info": "/api/samples (GET)",
+            "delete_model": "/api/model/{model_name} (DELETE)",
+            "docs": "/docs"
+        }
+    }
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,36 +56,25 @@ def extract_landmarks_from_image_bytes(image_bytes) -> list:
         with mp_hands.Hands(
             static_image_mode=True, 
             max_num_hands=1,
-            min_detection_confidence=0.7,  # Mayor confianza para detección
-            min_tracking_confidence=0.7    # Mayor confianza para tracking
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
         ) as hands:
             results = hands.process(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
             
             if not results.multi_hand_landmarks:
                 return []
             
-            # Usar la mano con mayor confianza
-            hand_index = 0
-            max_confidence = 0
-            for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
-                # Calcular confianza basada en la visibilidad de puntos clave
-                visible_landmarks = sum(1 for lm in hand_landmarks.landmark if lm.visibility > 0.5)
-                confidence = visible_landmarks / len(hand_landmarks.landmark)
-                
-                if confidence > max_confidence:
-                    max_confidence = confidence
-                    hand_index = i
-            
-            hand = results.multi_hand_landmarks[hand_index]
+            # Usar la primera mano detectada
+            hand = results.multi_hand_landmarks[0]
             lm = []
             
-            # Extraer coordenadas normalizadas y adicionales
+            # Extraer coordenadas normalizadas
             for p in hand.landmark:
-                lm.extend([p.x, p.y, p.z, p.visibility])
+                lm.extend([p.x, p.y, p.z])
             
             # Añadir características adicionales para mejorar precisión
-            if len(lm) >= 12:  # Al menos 4 puntos (3 coordenadas + visibilidad cada uno)
-                # Calcular distancia entre puntos clave (ej: punta del pulgar y punta del índice)
+            if len(hand.landmark) >= 9:
+                # Calcular distancia entre puntos clave
                 thumb_tip = np.array([hand.landmark[4].x, hand.landmark[4].y, hand.landmark[4].z])
                 index_tip = np.array([hand.landmark[8].x, hand.landmark[8].y, hand.landmark[8].z])
                 distance = np.linalg.norm(thumb_tip - index_tip)
@@ -120,7 +127,7 @@ async def train_model(name: str = Form(...)):
                 'accuracy': res['accuracy'], 
                 'n_samples': res['n_samples'],
                 'report': res['classification_report'],
-                'message': f'Modelo entrenado con {res["accuracy"]*100:.2f}% de precisión'
+                'message': f'Modelo "{name}" entrenado con {res["accuracy"]*100:.2f}% de precisión'
             }
         )
     except Exception as e:
@@ -158,6 +165,49 @@ async def get_model_details(model_name: str):
     except Exception as e:
         logger.error(f"Model details error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete('/api/model/{model_name}')
+async def delete_model(model_name: str):
+    """Eliminar un modelo específico y sus metadatos"""
+    try:
+        # Verificar si el modelo existe
+        models = manager.list_models()
+        if model_name not in models:
+            raise HTTPException(status_code=404, detail='Model not found')
+        
+        # Obtener rutas de archivos
+        model_path = os.path.join(manager.models_dir, f"{model_name}.joblib")
+        metadata_path = os.path.join(manager.metadata_dir, f"{model_name}_metadata.json")
+        
+        # Eliminar archivos
+        files_deleted = []
+        if os.path.exists(model_path):
+            os.remove(model_path)
+            files_deleted.append('modelo')
+            logger.info(f"Model file deleted: {model_path}")
+        
+        if os.path.exists(metadata_path):
+            os.remove(metadata_path)
+            files_deleted.append('metadatos')
+            logger.info(f"Metadata file deleted: {metadata_path}")
+        
+        if not files_deleted:
+            raise HTTPException(status_code=404, detail='No files found to delete')
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                'status': 'success',
+                'message': f'Modelo "{model_name}" eliminado exitosamente',
+                'files_deleted': files_deleted
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete model error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f'Error deleting model: {str(e)}')
 
 @app.post('/api/predict')
 async def predict(file: UploadFile = File(...), model: str = Form(...)):
@@ -203,3 +253,7 @@ async def clear_samples():
     logger.info(f"Cleared {count} samples")
     
     return {'status': 'success', 'message': f'{count} muestras eliminadas'}
+
+# Para ejecutar directamente
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
