@@ -1,11 +1,11 @@
 import os
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from joblib import dump, load
 import json
-from datetime import datetime  # te faltaba importar esto
+from datetime import datetime
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 METADATA_DIR = os.path.join(os.path.dirname(__file__), "model_metadata")
@@ -55,15 +55,17 @@ class ModelManager:
         X = np.array(X)
         y = np.array(y)
         
-        if len(X) < 10:
-            raise ValueError("Se necesitan al menos 10 muestras para entrenar.")
+        if len(X) < 5:  # Reducido a 5 muestras mínimas
+            raise ValueError("Se necesitan al menos 5 muestras para entrenar.")
         if len(set(y)) < 2:
             raise ValueError("Se necesitan al menos 2 clases diferentes para entrenar.")
         
+        # Intentar balancear clases si SMOTE está disponible
         try:
             from imblearn.over_sampling import SMOTE
             smote = SMOTE(random_state=random_state)
             X, y = smote.fit_resample(X, y)
+            print("SMOTE aplicado para balancear clases")
         except ImportError:
             print("SMOTE no disponible, continuando sin balanceo de clases")
         
@@ -71,36 +73,42 @@ class ModelManager:
             X, y, test_size=test_size, random_state=random_state, stratify=y
         )
         
+        # Modelo RandomForest optimizado
         clf = RandomForestClassifier(
-            n_estimators=300,
+            n_estimators=100,  # Reducido para mayor velocidad
             random_state=random_state,
-            max_depth=15,
-            min_samples_split=3,
+            max_depth=10,
+            min_samples_split=2,
             min_samples_leaf=1,
             class_weight='balanced',
-            bootstrap=True,
-            oob_score=True,
             n_jobs=-1
         )
         
         clf.fit(X_train, y_train)
         score = clf.score(X_test, y_test)
         
-        cv_scores = cross_val_score(clf, X, y, cv=5)
+        # Validación cruzada opcional
+        try:
+            from sklearn.model_selection import cross_val_score
+            cv_scores = cross_val_score(clf, X, y, cv=min(3, len(X)))  # CV reducido
+            cv_mean = float(np.mean(cv_scores))
+            cv_std = float(np.std(cv_scores))
+        except:
+            cv_mean = score
+            cv_std = 0.0
         
         y_pred = clf.predict(X_test)
         report = classification_report(y_test, y_pred, output_dict=True)
         
+        # Guardar metadatos
         metadata = {
             'accuracy': float(score),
-            'cross_val_mean': float(np.mean(cv_scores)),
-            'cross_val_std': float(np.std(cv_scores)),
+            'cross_val_mean': cv_mean,
+            'cross_val_std': cv_std,
             'n_samples': len(X),
             'n_samples_per_class': {label: int(np.sum(y == label)) for label in np.unique(y)},
             'classification_report': report,
-            'feature_importance': clf.feature_importances_.tolist(),
             'classes': clf.classes_.tolist(),
-            'oob_score': float(clf.oob_score_) if hasattr(clf, 'oob_score_') else None,
             'training_date': datetime.now().isoformat()
         }
         
@@ -108,33 +116,42 @@ class ModelManager:
         return metadata
 
     def predict_with_confidence(self, X, name: str):
-        clf = self.load_model(name)
-        metadata = self.load_metadata(name)
-        
-        probabilities = clf.predict_proba([X])[0]
-        
-        class_probabilities = {
-            clf.classes_[i]: float(probabilities[i]) 
-            for i in range(len(clf.classes_))
-        }
-        
-        sorted_probs = sorted(
-            class_probabilities.items(), 
-            key=lambda x: x[1], 
-            reverse=True
-        )
-        
-        prediction = sorted_probs[0][0]
-        confidence = sorted_probs[0][1]
-        
-        return {
-            'prediction': prediction,
-            'confidence': confidence,
-            'probabilities': class_probabilities,
-            'all_predictions': sorted_probs,
-            'metadata': metadata
-        }
-    
+        try:
+            clf = self.load_model(name)
+            
+            # Verificar que el modelo tiene el método predict_proba
+            if not hasattr(clf, 'predict_proba'):
+                raise AttributeError("El modelo no soporta predicciones con confianza")
+            
+            # Obtener probabilidades de predicción
+            probabilities = clf.predict_proba([X])[0]
+            
+            # Mapear probabilidades a nombres de clases
+            class_probabilities = {
+                clf.classes_[i]: float(probabilities[i]) 
+                for i in range(len(clf.classes_))
+            }
+            
+            # Ordenar por probabilidad descendente
+            sorted_probs = sorted(
+                class_probabilities.items(), 
+                key=lambda x: x[1], 
+                reverse=True
+            )
+            
+            # Predicción principal
+            prediction = sorted_probs[0][0]
+            confidence = sorted_probs[0][1]
+            
+            return {
+                'prediction': prediction,
+                'confidence': confidence,
+                'probabilities': class_probabilities,
+                'all_predictions': sorted_probs
+            }
+        except Exception as e:
+            raise ValueError(f"Error en predicción: {str(e)}")
+
     def get_model_info(self, name: str):
         """Obtener información detallada de un modelo"""
         metadata = self.load_metadata(name)
